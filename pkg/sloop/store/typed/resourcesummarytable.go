@@ -9,8 +9,8 @@ package typed
 
 import (
 	"fmt"
+	"github.com/salesforce/sloop/pkg/sloop/common"
 	"github.com/salesforce/sloop/pkg/sloop/store/untyped"
-	"strings"
 	"time"
 )
 
@@ -35,18 +35,20 @@ func NewResourceSummaryKey(timestamp time.Time, kind string, namespace string, n
 	return &ResourceSummaryKey{PartitionId: partitionId, Kind: kind, Namespace: namespace, Name: name, Uid: uid}
 }
 
-func (_ *ResourceSummaryKey) TableName() string {
+func NewResourceSummaryKeyComparator(kind string, namespace string, name string, uid string) *ResourceSummaryKey {
+	return &ResourceSummaryKey{Kind: kind, Namespace: namespace, Name: name, Uid: uid}
+}
+
+func (*ResourceSummaryKey) TableName() string {
 	return "ressum"
 }
 
 func (k *ResourceSummaryKey) Parse(key string) error {
-	parts := strings.Split(key, "/")
-	if len(parts) != 7 {
-		return fmt.Errorf("Key should have 6 parts: %v", key)
+	err, parts := common.ParseKey(key)
+	if err != nil {
+		return err
 	}
-	if parts[0] != "" {
-		return fmt.Errorf("Key should start with /: %v", key)
-	}
+
 	if parts[1] != k.TableName() {
 		return fmt.Errorf("Second part of key (%v) should be %v", key, k.TableName())
 	}
@@ -58,15 +60,20 @@ func (k *ResourceSummaryKey) Parse(key string) error {
 	return nil
 }
 
+//todo: need to make sure it can work as keyPrefix when some fields are empty
 func (k *ResourceSummaryKey) String() string {
-	return fmt.Sprintf("/%v/%v/%v/%v/%v/%v", k.TableName(), k.PartitionId, k.Kind, k.Namespace, k.Name, k.Uid)
+	if k.Uid == "" {
+		return fmt.Sprintf("/%v/%v/%v/%v/%v", k.TableName(), k.PartitionId, k.Kind, k.Namespace, k.Name)
+	} else {
+		return fmt.Sprintf("/%v/%v/%v/%v/%v/%v", k.TableName(), k.PartitionId, k.Kind, k.Namespace, k.Name, k.Uid)
+	}
 }
 
 func (k *ResourceSummaryKey) SetPartitionId(newPartitionId string) {
 	k.PartitionId = newPartitionId
 }
 
-func (_ *ResourceSummaryKey) ValidateKey(key string) error {
+func (*ResourceSummaryKey) ValidateKey(key string) error {
 	newKey := ResourceSummaryKey{}
 	return newKey.Parse(key)
 }

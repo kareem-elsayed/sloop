@@ -9,23 +9,26 @@ package server
 
 import (
 	"flag"
+	"os"
+	"path"
+	"strings"
+	"time"
+
 	"github.com/pkg/errors"
+
 	"github.com/salesforce/sloop/pkg/sloop/ingress"
 	"github.com/salesforce/sloop/pkg/sloop/server/internal/config"
 	"github.com/salesforce/sloop/pkg/sloop/store/typed"
 	"github.com/salesforce/sloop/pkg/sloop/store/untyped"
-	"os"
-	"path"
-	"strings"
 
 	"github.com/golang/glog"
+
+	"github.com/spf13/afero"
 
 	"github.com/salesforce/sloop/pkg/sloop/processing"
 	"github.com/salesforce/sloop/pkg/sloop/store/untyped/badgerwrap"
 	"github.com/salesforce/sloop/pkg/sloop/storemanager"
 	"github.com/salesforce/sloop/pkg/sloop/webserver"
-	"github.com/spf13/afero"
-	"time"
 )
 
 const alsologtostderr = "alsologtostderr"
@@ -42,9 +45,9 @@ func RealMain() error {
 		return errors.Wrap(err, "config validation failed")
 	}
 
-	kubeClient, kubeContext, err := ingress.MakeKubernetesClient(conf.ApiServerHost, conf.UseKubeContext)
+	kubeContext, err := ingress.GetKubernetesContext(conf.ApiServerHost, conf.UseKubeContext)
 	if err != nil {
-		return errors.Wrap(err, "failed to create kubernetes client")
+		return errors.Wrap(err, "failed to get kubernetes context")
 	}
 
 	// Channel used for updates from ingress to store
@@ -54,11 +57,36 @@ func RealMain() error {
 	factory := &badgerwrap.BadgerFactory{}
 
 	storeRootWithKubeContext := path.Join(conf.StoreRoot, kubeContext)
-	db, err := untyped.OpenStore(factory, storeRootWithKubeContext, time.Duration(1)*time.Hour)
+	storeConfig := &untyped.Config{
+		RootPath:                 storeRootWithKubeContext,
+		ConfigPartitionDuration:  time.Duration(1) * time.Hour,
+		BadgerMaxTableSize:       conf.BadgerMaxTableSize,
+		BadgerKeepL0InMemory:     conf.BadgerKeepL0InMemory,
+		BadgerVLogFileSize:       conf.BadgerVLogFileSize,
+		BadgerVLogMaxEntries:     conf.BadgerVLogMaxEntries,
+		BadgerUseLSMOnlyOptions:  conf.BadgerUseLSMOnlyOptions,
+		BadgerEnableEventLogging: conf.BadgerEnableEventLogging,
+		BadgerNumOfCompactors:    conf.BadgerNumOfCompactors,
+		BadgerNumL0Tables:        conf.BadgerNumL0Tables,
+		BadgerNumL0TablesStall:   conf.BadgerNumL0TablesStall,
+		BadgerSyncWrites:         conf.BadgerSyncWrites,
+		BadgerLevelOneSize:       conf.BadgerLevelOneSize,
+		BadgerLevSizeMultiplier:  conf.BadgerLevSizeMultiplier,
+	}
+	db, err := untyped.OpenStore(factory, storeConfig)
 	if err != nil {
 		return errors.Wrap(err, "failed to init untyped store")
 	}
 	defer untyped.CloseStore(db)
+
+	if conf.RestoreDatabaseFile != "" {
+		glog.Infof("Restoring from backup file %q into context %q", conf.RestoreDatabaseFile, kubeContext)
+		err := ingress.DatabaseRestore(db, conf.RestoreDatabaseFile)
+		if err != nil {
+			return errors.Wrap(err, "failed to restore database")
+		}
+		glog.Infof("Restored from backup file %q into context %q", conf.RestoreDatabaseFile, kubeContext)
+	}
 
 	tables := typed.NewTableList(db)
 	processor := processing.NewProcessing(kubeWatchChan, tables, conf.KeepMinorNodeUpdates, conf.MaxLookback)
@@ -67,7 +95,12 @@ func RealMain() error {
 	// Real kubernetes watcher
 	var kubeWatcherSource ingress.KubeWatcher
 	if !conf.DisableKubeWatcher {
-		kubeWatcherSource, err = ingress.NewKubeWatcherSource(kubeClient, kubeWatchChan, conf.KubeWatchResyncInterval, conf.Crds)
+		kubeClient, err := ingress.MakeKubernetesClient(conf.ApiServerHost, kubeContext)
+		if err != nil {
+			return errors.Wrap(err, "failed to create kubernetes client")
+		}
+
+		kubeWatcherSource, err = ingress.NewKubeWatcherSource(kubeClient, kubeWatchChan, conf.KubeWatchResyncInterval, conf.WatchCrds, conf.ApiServerHost, kubeContext)
 		if err != nil {
 			return errors.Wrap(err, "failed to initialize kubeWatcher")
 		}
@@ -90,7 +123,17 @@ func RealMain() error {
 	var storemgr *storemanager.StoreManager
 	if !conf.DisableStoreManager {
 		fs := &afero.Afero{Fs: afero.NewOsFs()}
-		storemgr = storemanager.NewStoreManager(tables, conf.StoreRoot, conf.CleanupFrequency, conf.MaxLookback, conf.MaxDiskMb, fs)
+		storeCfg := &storemanager.Config{
+			StoreRoot:          conf.StoreRoot,
+			Freq:               conf.CleanupFrequency,
+			TimeLimit:          conf.MaxLookback,
+			SizeLimitBytes:     conf.MaxDiskMb * 1024 * 1024,
+			BadgerDiscardRatio: conf.BadgerDiscardRatio,
+			BadgerVLogGCFreq:   conf.BadgerVLogGCFreq,
+			DeletionBatchSize:  conf.DeletionBatchSize,
+			GCThreshold:        conf.ThresholdForGC,
+		}
+		storemgr = storemanager.NewStoreManager(tables, storeCfg, fs)
 		storemgr.Start()
 	}
 

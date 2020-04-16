@@ -10,8 +10,8 @@ package typed
 import (
 	"fmt"
 	"github.com/pkg/errors"
+	"github.com/salesforce/sloop/pkg/sloop/common"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -35,18 +35,20 @@ func NewWatchTableKey(partitionId string, kind string, namespace string, name st
 	return &WatchTableKey{PartitionId: partitionId, Kind: kind, Namespace: namespace, Name: name, Timestamp: timestamp}
 }
 
-func (_ *WatchTableKey) TableName() string {
+func NewWatchTableKeyComparator(kind string, namespace string, name string, timestamp time.Time) *WatchTableKey {
+	return &WatchTableKey{Kind: kind, Namespace: namespace, Name: name, Timestamp: timestamp}
+}
+
+func (*WatchTableKey) TableName() string {
 	return "watch"
 }
 
 func (k *WatchTableKey) Parse(key string) error {
-	parts := strings.Split(key, "/")
-	if len(parts) != 7 {
-		return fmt.Errorf("Key should have 6 parts: %v", key)
+	err, parts := common.ParseKey(key)
+	if err != nil {
+		return err
 	}
-	if parts[0] != "" {
-		return fmt.Errorf("Key should start with /: %v", key)
-	}
+
 	if parts[1] != k.TableName() {
 		return fmt.Errorf("Second part of key (%v) should be %v", key, k.TableName())
 	}
@@ -66,15 +68,18 @@ func (k *WatchTableKey) SetPartitionId(newPartitionId string) {
 	k.PartitionId = newPartitionId
 }
 
+//todo: need to make sure it can work as keyPrefix when some fields are empty
 func (k *WatchTableKey) String() string {
-	if k.Timestamp.IsZero() {
-		return fmt.Sprintf("/%v/%v/%v/%v/%v/", k.TableName(), k.PartitionId, k.Kind, k.Namespace, k.Name)
+	if k.Name == "" && k.Timestamp.IsZero() {
+		return fmt.Sprintf("/%v/%v/%v/%v", k.TableName(), k.PartitionId, k.Kind, k.Namespace)
+	} else if k.Timestamp.IsZero() {
+		return fmt.Sprintf("/%v/%v/%v/%v/%v", k.TableName(), k.PartitionId, k.Kind, k.Namespace, k.Name)
 	} else {
 		return fmt.Sprintf("/%v/%v/%v/%v/%v/%v", k.TableName(), k.PartitionId, k.Kind, k.Namespace, k.Name, k.Timestamp.UnixNano())
 	}
 }
 
-func (_ *WatchTableKey) ValidateKey(key string) error {
+func (*WatchTableKey) ValidateKey(key string) error {
 	newKey := WatchTableKey{}
 	return newKey.Parse(key)
 }

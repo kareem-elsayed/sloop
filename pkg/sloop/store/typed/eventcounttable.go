@@ -9,10 +9,10 @@ package typed
 
 import (
 	"fmt"
-	"github.com/dgraph-io/badger"
+	badger "github.com/dgraph-io/badger/v2"
+	"github.com/salesforce/sloop/pkg/sloop/common"
 	"github.com/salesforce/sloop/pkg/sloop/store/untyped"
 	"github.com/salesforce/sloop/pkg/sloop/store/untyped/badgerwrap"
-	"strings"
 	"time"
 )
 
@@ -29,18 +29,20 @@ func NewEventCountKey(timestamp time.Time, kind string, namespace string, name s
 	return &EventCountKey{PartitionId: partitionId, Kind: kind, Namespace: namespace, Name: name, Uid: uid}
 }
 
-func (_ *EventCountKey) TableName() string {
+func NewEventCountKeyComparator(kind string, namespace string, name string, uid string) *EventCountKey {
+	return &EventCountKey{Kind: kind, Namespace: namespace, Name: name, Uid: uid}
+}
+
+func (*EventCountKey) TableName() string {
 	return "eventcount"
 }
 
 func (k *EventCountKey) Parse(key string) error {
-	parts := strings.Split(key, "/")
-	if len(parts) != 7 {
-		return fmt.Errorf("Key should have 6 parts: %v", key)
+	err, parts := common.ParseKey(key)
+	if err != nil {
+		return err
 	}
-	if parts[0] != "" {
-		return fmt.Errorf("Key should start with /: %v", key)
-	}
+
 	if parts[1] != k.TableName() {
 		return fmt.Errorf("Second part of key (%v) should be %v", key, k.TableName())
 	}
@@ -52,11 +54,16 @@ func (k *EventCountKey) Parse(key string) error {
 	return nil
 }
 
+//todo: need to make sure it can work as keyPrefix when some fields are empty
 func (k *EventCountKey) String() string {
-	return fmt.Sprintf("/%v/%v/%v/%v/%v/%v", k.TableName(), k.PartitionId, k.Kind, k.Namespace, k.Name, k.Uid)
+	if k.Uid == "" {
+		return fmt.Sprintf("/%v/%v/%v/%v/%v", k.TableName(), k.PartitionId, k.Kind, k.Namespace, k.Name)
+	} else {
+		return fmt.Sprintf("/%v/%v/%v/%v/%v/%v", k.TableName(), k.PartitionId, k.Kind, k.Namespace, k.Name, k.Uid)
+	}
 }
 
-func (_ *EventCountKey) ValidateKey(key string) error {
+func (*EventCountKey) ValidateKey(key string) error {
 	newKey := EventCountKey{}
 	return newKey.Parse(key)
 }

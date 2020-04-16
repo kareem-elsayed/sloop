@@ -8,35 +8,44 @@
 package webserver
 
 import (
-	"github.com/salesforce/sloop/pkg/sloop/queries"
-	"github.com/salesforce/sloop/pkg/sloop/store/typed"
-	"log"
-
-	"github.com/golang/glog"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-
 	"context"
+	"expvar"
 	"fmt"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"io/ioutil"
+	"log"
 	"mime"
 	"net/http"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/salesforce/sloop/pkg/sloop/queries"
+	"github.com/salesforce/sloop/pkg/sloop/store/typed"
+	"github.com/salesforce/sloop/pkg/sloop/store/untyped/badgerwrap"
+
+	"github.com/golang/glog"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"golang.org/x/net/trace"
 )
 
 const (
-	debugViewKeyTemplateFile  = "debugviewkey.html"
-	debugListKeysTemplateFile = "debuglistkeys.html"
-	debugConfigTemplateFile   = "debugconfig.html"
-	indexTemplateFile         = "index.html"
-	resourceTemplateFile      = "resource.html"
+	debugViewKeyTemplateFile      = "debugviewkey.html"
+	debugListKeysTemplateFile     = "debuglistkeys.html"
+	debugHistogramFile            = "debughistogram.html"
+	debugConfigTemplateFile       = "debugconfig.html"
+	debugTemplateFile             = "debug.html"
+	debugBadgerTablesTemplateFile = "debugtables.html"
+	indexTemplateFile             = "index.html"
+	resourceTemplateFile          = "resource.html"
 )
 
 type WebConfig struct {
@@ -53,7 +62,8 @@ type WebConfig struct {
 }
 
 var (
-	metricWebServerRequestCount = promauto.NewCounter(prometheus.CounterOpts{Name: "sloop_webserver_request_count"})
+	metricWebServerRequestCount   = promauto.NewCounter(prometheus.CounterOpts{Name: "sloop_webserver_request_count"})
+	metricWebServerRequestLatency = promauto.NewGauge(prometheus.GaugeOpts{Name: "sloop_webserver_request_latency_sec"})
 )
 
 // This is not going to change and we don't want to pass it to every function
@@ -100,6 +110,37 @@ func webFileHandler(w http.ResponseWriter, r *http.Request) {
 	glog.V(2).Infof("webFileHandler successfully returned file %v for %v", fixedUrl, r.URL)
 }
 
+// backupHandler streams a download of a backup of the database.
+// It is a simple HTTP translation of the Badger DB's built-in online backup function.
+// If the optional `since` query parameter is provided, the backup will only include versions since the version provided.
+func backupHandler(db badgerwrap.DB, currentContext string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sinceStr := r.URL.Query().Get("since")
+		if sinceStr == "" {
+			sinceStr = "0"
+		}
+		since, err := strconv.ParseUint(sinceStr, 10, 64)
+		if err != nil {
+			logWebError(err, "Error parsing 'since' parameter. Must be expressed as a positive integer.", r, w)
+			return
+		}
+
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=sloop-%s-%d.bak", currentContext, since))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Transfer-Encoding", "chunked")
+
+		_, err = db.Backup(w, since)
+		if err != nil {
+			logWebError(err, "Error writing backup", r, w)
+			return
+		}
+
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+}
+
 // Returns json to feed into dhtmlgantt
 // Info on data format: https://docs.dhtmlx.com/gantt/desktop__loading.html
 
@@ -118,16 +159,35 @@ func queryHandler(tables typed.Tables, maxLookBack time.Duration) http.HandlerFu
 	}
 }
 
+func healthHandler() http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+		writer.Write([]byte(http.StatusText(http.StatusOK)))
+	}
+}
+
 func Run(config WebConfig, tables typed.Tables) error {
 	webFiles = config.WebFilesPath
 	server := &Server{}
 	server.mux = http.NewServeMux()
 	server.mux.HandleFunc("/webfiles/", webFileHandler)
+	server.mux.HandleFunc("/data/backup", backupHandler(tables.Db(), config.CurrentContext))
 	server.mux.HandleFunc("/data", queryHandler(tables, config.MaxLookback))
 	server.mux.HandleFunc("/resource", resourceHandler(config.ResourceLinks))
-	server.mux.HandleFunc("/debug/", listKeysHandler(tables))
+	// Debug pages
+	server.mux.HandleFunc("/debug/", debugHandler())
+	server.mux.HandleFunc("/debug/listkeys/", listKeysHandler(tables))
+	server.mux.HandleFunc("/debug/histogram/", histogramHandler(tables))
+	server.mux.HandleFunc("/debug/tables/", debugBadgerTablesHandler(tables.Db()))
 	server.mux.HandleFunc("/debug/view/", viewKeyHandler(tables))
 	server.mux.HandleFunc("/debug/config/", configHandler(config.ConfigYaml))
+	// Badger uses the trace package, which registers /debug/requests and /debug/events
+	server.mux.HandleFunc("/debug/requests", trace.Traces)
+	server.mux.HandleFunc("/debug/events", trace.Events)
+	// Badger also uses expvar which exposes prometheus compatible metrics on /debug/vars
+	server.mux.HandleFunc("/debug/vars", expvar.Handler().ServeHTTP)
+
+	server.mux.HandleFunc("/healthz", healthHandler())
 	server.mux.Handle("/metrics", promhttp.Handler())
 	server.mux.HandleFunc("/", indexHandler(config))
 

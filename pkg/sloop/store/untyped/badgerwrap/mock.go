@@ -9,10 +9,12 @@ package badgerwrap
 
 import (
 	"fmt"
-	"github.com/dgraph-io/badger"
+	"io"
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/dgraph-io/badger/v2"
 )
 
 // This mock simulates badger using an in-memory store
@@ -108,6 +110,18 @@ func (b *MockDb) Tables(withKeysCount bool) []badger.TableInfo {
 	}
 }
 
+func (b *MockDb) Backup(w io.Writer, since uint64) (uint64, error) {
+	return 0, nil
+}
+
+func (b *MockDb) Load(r io.Reader, maxPendingWrites int) error {
+	return nil
+}
+
+func (b *MockDb) RunValueLogGC(discardRatio float64) error {
+	return nil
+}
+
 // Transaction
 
 func (t *MockTxn) Get(key []byte) (Item, error) {
@@ -163,6 +177,21 @@ func (i *MockItem) ValueCopy(dst []byte) ([]byte, error) {
 	newcopy := make([]byte, len(i.value))
 	copy(newcopy, i.value)
 	return newcopy, nil
+}
+
+func (i *MockItem) EstimatedSize() int64 {
+	return int64(len(i.key) + len(i.value))
+}
+
+func (i *MockItem) IsDeletedOrExpired() bool {
+	return false
+}
+
+func (i *MockItem) KeyCopy(dst []byte) []byte {
+	copy(dst, i.key)
+	newcopy := make([]byte, len(i.key))
+	copy(newcopy, i.key)
+	return newcopy
 }
 
 // Iterator

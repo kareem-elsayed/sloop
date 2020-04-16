@@ -8,7 +8,9 @@
 package badgerwrap
 
 import (
-	"github.com/dgraph-io/badger"
+	"io"
+
+	"github.com/dgraph-io/badger/v2"
 )
 
 // Need a factory we can pass into untyped store so it can open and close databases
@@ -25,13 +27,13 @@ type DB interface {
 	DropPrefix(prefix []byte) error
 	Size() (lsm, vlog int64)
 	Tables(withKeysCount bool) []badger.TableInfo
-	//	Backup(w io.Writer, since uint64) (uint64, error)
+	Backup(w io.Writer, since uint64) (uint64, error)
 	//	DropAll() error
 	//	Flatten(workers int) error
 	//	GetMergeOperator(key []byte, f MergeFunc, dur time.Duration) *MergeOperator
 	//	GetSequence(key []byte, bandwidth uint64) (*Sequence, error)
 	//	KeySplits(prefix []byte) []string
-	//	Load(r io.Reader, maxPendingWrites int) error
+	Load(r io.Reader, maxPendingWrites int) error
 	//	MaxBatchCount() int64
 	//	MaxBatchSize() int64
 	//	NewKVLoader(maxPendingWrites int) *KVLoader
@@ -42,7 +44,7 @@ type DB interface {
 	//	NewTransactionAt(readTs uint64, update bool) *Txn
 	//	NewWriteBatch() *WriteBatch
 	//	PrintHistogram(keyPrefix []byte)
-	//	RunValueLogGC(discardRatio float64) error
+	RunValueLogGC(discardRatio float64) error
 	//	SetDiscardTs(ts uint64)
 	//	Subscribe(ctx context.Context, cb func(kv *KVList), prefixes ...[]byte) error
 	//	VerifyChecksum() error
@@ -67,10 +69,10 @@ type Item interface {
 	Value(fn func(val []byte) error) error
 	ValueCopy(dst []byte) ([]byte, error)
 	//	DiscardEarlierVersions() bool
-	//	EstimatedSize() int64
+	EstimatedSize() int64
 	//	ExpiresAt() uint64
-	//	IsDeletedOrExpired() bool
-	//	KeyCopy(dst []byte) []byte
+	IsDeletedOrExpired() bool
+	KeyCopy(dst []byte) []byte
 	//	KeySize() int64
 	//	String() string
 	//	UserMeta() byte

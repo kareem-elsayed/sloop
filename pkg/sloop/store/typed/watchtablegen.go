@@ -16,7 +16,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/dgraph-io/badger"
+	"github.com/dgraph-io/badger/v2"
 	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/salesforce/sloop/pkg/sloop/store/untyped"
@@ -106,97 +106,48 @@ func (t *KubeWatchResultTable) GetMaxKey(txn badgerwrap.Txn) (bool, string) {
 }
 
 func (t *KubeWatchResultTable) GetMinMaxPartitions(txn badgerwrap.Txn) (bool, string, string) {
-	ok, minKeyStr := t.GetMinKey(txn)
-	if !ok {
-		return false, "", ""
-	}
-	ok, maxKeyStr := t.GetMaxKey(txn)
-	if !ok {
-		// This should be impossible
+	minPartitionOk, minPar := t.GetMinPartition(txn)
+
+	if !minPartitionOk {
 		return false, "", ""
 	}
 
-	minKey := &WatchTableKey{}
+	maxPartitionOk, maxPar := t.GetMaxPartition(txn)
+	return maxPartitionOk, minPar, maxPar
+}
+
+func (t *KubeWatchResultTable) GetMaxPartition(txn badgerwrap.Txn) (bool, string) {
+	ok, maxKeyStr := t.GetMaxKey(txn)
+	if !ok {
+		return false, ""
+	}
+
 	maxKey := &WatchTableKey{}
+
+	err := maxKey.Parse(maxKeyStr)
+	if err != nil {
+		panic(fmt.Sprintf("invalid key in table: %v key: %q error: %v", t.tableName, maxKeyStr, err))
+	}
+
+	return true, maxKey.PartitionId
+}
+
+func (t *KubeWatchResultTable) GetMinPartition(txn badgerwrap.Txn) (bool, string) {
+	ok, minKeyStr := t.GetMinKey(txn)
+	if !ok {
+		return false, ""
+	}
+
+	minKey := &WatchTableKey{}
 
 	err := minKey.Parse(minKeyStr)
 	if err != nil {
 		panic(fmt.Sprintf("invalid key in table: %v key: %q error: %v", t.tableName, minKeyStr, err))
 	}
 
-	err = maxKey.Parse(maxKeyStr)
-	if err != nil {
-		panic(fmt.Sprintf("invalid key in table: %v key: %q error: %v", t.tableName, maxKeyStr, err))
-	}
-
-	return true, minKey.PartitionId, maxKey.PartitionId
+	return true, minKey.PartitionId
 }
 
-func (t *KubeWatchResultTable) RangeRead(
-	txn badgerwrap.Txn,
-	keyPredicateFn func(string) bool,
-	valPredicateFn func(*KubeWatchResult) bool,
-	startTime time.Time,
-	endTime time.Time) (map[WatchTableKey]*KubeWatchResult, RangeReadStats, error) {
-
-	resources := map[WatchTableKey]*KubeWatchResult{}
-
-	keyPrefix := "/" + t.tableName + "/"
-	iterOpt := badger.DefaultIteratorOptions
-	iterOpt.Prefix = []byte(keyPrefix)
-	itr := txn.NewIterator(iterOpt)
-	defer itr.Close()
-
-	startPartition := untyped.GetPartitionId(startTime)
-	endPartition := untyped.GetPartitionId(endTime)
-	startPartitionPrefix := keyPrefix + startPartition + "/"
-
-	stats := RangeReadStats{}
-	before := time.Now()
-
-	lastPartition := ""
-	for itr.Seek([]byte(startPartitionPrefix)); itr.ValidForPrefix([]byte(keyPrefix)); itr.Next() {
-		stats.RowsVisitedCount += 1
-		if !keyPredicateFn(string(itr.Item().Key())) {
-			continue
-		}
-		stats.RowsPassedKeyPredicateCount += 1
-
-		key := WatchTableKey{}
-		err := key.Parse(string(itr.Item().Key()))
-		if err != nil {
-			return nil, stats, err
-		}
-		if key.PartitionId != lastPartition {
-			stats.PartitionCount += 1
-			lastPartition = key.PartitionId
-		}
-		// partitions are zero padded to 12 digits so we can compare them lexicographically
-		if key.PartitionId > endPartition {
-			// end of range
-			break
-		}
-		valueBytes, err := itr.Item().ValueCopy([]byte{})
-		if err != nil {
-			return nil, stats, err
-		}
-		retValue := &KubeWatchResult{}
-		err = proto.Unmarshal(valueBytes, retValue)
-		if err != nil {
-			return nil, stats, err
-		}
-		if valPredicateFn != nil && !valPredicateFn(retValue) {
-			continue
-		}
-		stats.RowsPassedValuePredicateCount += 1
-		resources[key] = retValue
-	}
-	stats.Elapsed = time.Since(before)
-	stats.TableName = (&WatchTableKey{}).TableName()
-	return resources, stats, nil
-}
-
-//todo: need to add unit test
 func (t *KubeWatchResultTable) GetUniquePartitionList(txn badgerwrap.Txn) ([]string, error) {
 	resources := []string{}
 	ok, minPar, maxPar := t.GetMinMaxPartitions(txn)
@@ -216,8 +167,7 @@ func (t *KubeWatchResultTable) GetUniquePartitionList(txn badgerwrap.Txn) ([]str
 	return resources, nil
 }
 
-//todo: need to add unit test
-func (t *KubeWatchResultTable) GetPreviousKey(txn badgerwrap.Txn, key *WatchTableKey, keyPrefix *WatchTableKey) (*WatchTableKey, error) {
+func (t *KubeWatchResultTable) GetPreviousKey(txn badgerwrap.Txn, key *WatchTableKey, keyComparator *WatchTableKey) (*WatchTableKey, error) {
 	partitionList, err := t.GetUniquePartitionList(txn)
 	if err != nil {
 		return &WatchTableKey{}, errors.Wrapf(err, "failed to get partition list from table:%v", t.tableName)
@@ -228,7 +178,7 @@ func (t *KubeWatchResultTable) GetPreviousKey(txn badgerwrap.Txn, key *WatchTabl
 		if prePart > currentPartition {
 			continue
 		} else {
-			prevFound, prevKey, err := t.getLastMatchingKeyInPartition(txn, prePart, key, keyPrefix)
+			prevFound, prevKey, err := t.getLastMatchingKeyInPartition(txn, prePart, key, keyComparator)
 			if err != nil {
 				return &WatchTableKey{}, errors.Wrapf(err, "Failure getting previous key for %v, for partition id:%v", key.String(), prePart)
 			}
@@ -237,11 +187,10 @@ func (t *KubeWatchResultTable) GetPreviousKey(txn badgerwrap.Txn, key *WatchTabl
 			}
 		}
 	}
-	return &WatchTableKey{}, fmt.Errorf("failed to get any previous key in table:%v, for key:%v, keyPrefix:%v", t.tableName, key.String(), keyPrefix)
+	return &WatchTableKey{}, fmt.Errorf("failed to get any previous key in table:%v, for key:%v, keyComparator:%v", t.tableName, key.String(), keyComparator)
 }
 
-//todo: need to add unit test
-func (t *KubeWatchResultTable) getLastMatchingKeyInPartition(txn badgerwrap.Txn, curPartition string, curKey *WatchTableKey, keyPrefix *WatchTableKey) (bool, *WatchTableKey, error) {
+func (t *KubeWatchResultTable) getLastMatchingKeyInPartition(txn badgerwrap.Txn, curPartition string, curKey *WatchTableKey, keyComparator *WatchTableKey) (bool, *WatchTableKey, error) {
 	iterOpt := badger.DefaultIteratorOptions
 	iterOpt.Reverse = true
 	itr := txn.NewIterator(iterOpt)
@@ -251,16 +200,17 @@ func (t *KubeWatchResultTable) getLastMatchingKeyInPartition(txn badgerwrap.Txn,
 
 	// update partition with current value
 	curKey.SetPartitionId(curPartition)
-	keySeekStr := curKey.String() + string(rune(255))
+	keyComparator.SetPartitionId(curPartition)
 
+	keySeekStr := curKey.String() + string(rune(255))
 	itr.Seek([]byte(keySeekStr))
 
 	// if the result is same as key, we want to check its previous one
-	if oldKey == string(itr.Item().Key()) {
+	if itr.Valid() && oldKey == string(itr.Item().Key()) {
 		itr.Next()
 	}
 
-	if itr.ValidForPrefix([]byte(keyPrefix.String())) {
+	if itr.ValidForPrefix([]byte(keyComparator.String())) {
 		key := &WatchTableKey{}
 		err := key.Parse(string(itr.Item().Key()))
 		if err != nil {
@@ -269,4 +219,115 @@ func (t *KubeWatchResultTable) getLastMatchingKeyInPartition(txn badgerwrap.Txn,
 		return true, key, nil
 	}
 	return false, &WatchTableKey{}, nil
+}
+
+func (t *KubeWatchResultTable) RangeRead(txn badgerwrap.Txn, keyPrefix *WatchTableKey,
+	keyPredicateFn func(string) bool, valPredicateFn func(*KubeWatchResult) bool, startTime time.Time, endTime time.Time) (map[WatchTableKey]*KubeWatchResult, RangeReadStats, error) {
+	resources := map[WatchTableKey]*KubeWatchResult{}
+
+	stats := RangeReadStats{}
+	before := time.Now()
+
+	partitionList, err := t.GetPartitionsFromTimeRange(txn, startTime, endTime)
+	stats.PartitionCount = len(partitionList)
+	if err != nil {
+		return resources, stats, errors.Wrapf(err, "failed to get partitions from table:%v, from startTime:%v, to endTime:%v", t.tableName, startTime, endTime)
+	}
+
+	for _, currentPartition := range partitionList {
+		var seekStr string
+
+		// when keyPrefix does not have such info as kind,namespace,and etc, we seek from /tableName/currentPartition/
+		if keyPrefix == nil {
+			seekStr = "/" + t.tableName + "/" + currentPartition + "/"
+		} else {
+			// update keyPrefix with current partition
+			keyPrefix.SetPartitionId(currentPartition)
+			seekStr = keyPrefix.String()
+		}
+
+		itr := txn.NewIterator(badger.IteratorOptions{Prefix: []byte(seekStr)})
+		defer itr.Close()
+
+		//in worst case, when seekStr = /table/partition, we need to iterate a key list and return all of them
+		//in most cases, we should only hit one result per partition
+		for itr.Seek([]byte(seekStr)); itr.ValidForPrefix([]byte(seekStr)); itr.Next() {
+			stats.RowsVisitedCount += 1
+			if keyPredicateFn != nil {
+				if !keyPredicateFn(string(itr.Item().Key())) {
+					continue
+				}
+			}
+			key := WatchTableKey{}
+			err := key.Parse(string(itr.Item().Key()))
+			if err != nil {
+				return nil, stats, err
+			}
+
+			stats.RowsPassedKeyPredicateCount += 1
+
+			valueBytes, err := itr.Item().ValueCopy([]byte{})
+			if err != nil {
+				return nil, stats, err
+			}
+			retValue := &KubeWatchResult{}
+			err = proto.Unmarshal(valueBytes, retValue)
+			if err != nil {
+				return nil, stats, err
+			}
+			if valPredicateFn != nil && !valPredicateFn(retValue) {
+				continue
+			}
+			stats.RowsPassedValuePredicateCount += 1
+			resources[key] = retValue
+		}
+
+		//Close() is safe to call more than once, close at the end of each partition to avoid having old iterators open
+		itr.Close()
+	}
+
+	stats.Elapsed = time.Since(before)
+	stats.TableName = (&WatchTableKey{}).TableName()
+	return resources, stats, nil
+}
+
+//todo: need to add unit test
+func (t *KubeWatchResultTable) GetPartitionsFromTimeRange(txn badgerwrap.Txn, startTime time.Time, endTime time.Time) ([]string, error) {
+	resources := []string{}
+	startPartition := untyped.GetPartitionId(startTime)
+	endPartition := untyped.GetPartitionId(endTime)
+	parDuration := untyped.GetPartitionDuration()
+	for curPar := startPartition; curPar <= endPartition; {
+		resources = append(resources, curPar)
+		// update curPar
+		partInt, err := strconv.ParseInt(curPar, 10, 64)
+		if err != nil {
+			return resources, errors.Wrapf(err, "failed to get partition:%v", curPar)
+		}
+		parTime := time.Unix(partInt, 0).UTC().Add(parDuration)
+		curPar = untyped.GetPartitionId(parTime)
+	}
+	return resources, nil
+}
+
+func KubeWatchResult_ValPredicateFns(valFn ...func(*KubeWatchResult) bool) func(*KubeWatchResult) bool {
+	return func(result *KubeWatchResult) bool {
+		for _, thisFn := range valFn {
+			if !thisFn(result) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func KubeWatchResult_KeyPredicateFns(keyFn ...func(string) bool) func(string) bool {
+	return func(result string) bool {
+		for _, thisFn := range keyFn {
+			if !thisFn(result) {
+				return false
+			}
+		}
+		return true
+	}
 }

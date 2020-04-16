@@ -1,6 +1,4 @@
-.PHONY:perf perfasm
-
-export GO111MODULE=on
+.PHONY:all run linux docker generate tidy protobuf cover docker-push
 
 all:
 	go get ./pkg/...
@@ -15,10 +13,12 @@ run:
 linux:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go install -ldflags "-s" -installsuffix cgo -v ./pkg/...
 
-docker: linux
-	cp $(GOPATH)/bin/linux_amd64/sloop .
-	docker build -t sloop .
-	rm sloop
+docker:
+	docker build . -t sloop
+
+docker-push: docker
+	docker tag sloop:latest sloopimage/sloop:latest
+	docker push sloopimage/sloop:latest
 
 generate:
 	go generate ./pkg/...

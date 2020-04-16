@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/pkg/errors"
+	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
@@ -18,8 +20,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
-	"os"
 	"sync"
 	"time"
 
@@ -49,42 +49,29 @@ type kubeWatcherImpl struct {
 	currentContext  string
 }
 
-/* config.yaml snippet - namespace optional
-crds:
-- namespace: csc-sam
-  resourceArg: bundles.v1.samcrd.salesforce.com
-*/
-type CrdWatch struct {
-	ResourceArg string `json:"resourceArg"`
-	Namespace   string `json:"namespace,omitempty"`
-}
-
 var (
 	metricIngressKubewatchcount = promauto.NewCounterVec(prometheus.CounterOpts{Name: "sloop_ingress_kubewatchcount"}, []string{"kind", "watchtype", "namespace"})
 	metricIngressKubewatchbytes = promauto.NewCounterVec(prometheus.CounterOpts{Name: "sloop_ingress_kubewatchbytes"}, []string{"kind", "watchtype", "namespace"})
 )
 
-const (
-	KubeConfigEnv = "KUBECONFIG"
-)
-
 // Todo: Add additional parameters for filtering
-func NewKubeWatcherSource(kubeClient kubernetes.Interface, outChan chan typed.KubeWatchResult, resync time.Duration, crds []CrdWatch) (KubeWatcher, error) {
+func NewKubeWatcherSource(kubeClient kubernetes.Interface, outChan chan typed.KubeWatchResult, resync time.Duration, includeCrds bool, masterURL string, kubeContext string) (KubeWatcher, error) {
 	kw := &kubeWatcherImpl{resync: resync, outchanlock: &sync.Mutex{}}
 	kw.stopChan = make(chan struct{})
 	kw.outchan = outChan
 
-	kw.startWellKnownInformers(kubeClient, true)
-	if len(crds) != 0 {
-		err := kw.startCustomInformers(crds)
+	kw.startWellKnownInformers(kubeClient)
+	if includeCrds {
+		err := kw.startCustomInformers(masterURL, kubeContext)
 		if err != nil {
 			return nil, err
 		}
 	}
+
 	return kw, nil
 }
 
-func (i *kubeWatcherImpl) startWellKnownInformers(kubeclient kubernetes.Interface, includeEvents bool) {
+func (i *kubeWatcherImpl) startWellKnownInformers(kubeclient kubernetes.Interface) {
 	i.informerFactory = informers.NewSharedInformerFactory(kubeclient, i.resync)
 
 	i.informerFactory.Apps().V1beta1().Deployments().Informer().AddEventHandler(i.getEventHandlerForResource("Deployment"))
@@ -105,13 +92,16 @@ func (i *kubeWatcherImpl) startWellKnownInformers(kubeclient kubernetes.Interfac
 	i.informerFactory.Start(i.stopChan)
 }
 
-func (i *kubeWatcherImpl) startCustomInformers(requested []CrdWatch) error {
-	kubeCfg, err := rest.InClusterConfig()
-	if kubeConfig := os.Getenv(KubeConfigEnv); kubeConfig != "" {
-		kubeCfg, err = clientcmd.BuildConfigFromFlags("", kubeConfig)
-	}
+func (i *kubeWatcherImpl) startCustomInformers(masterURL string, kubeContext string) error {
+	clientCfg := getConfig(masterURL, kubeContext)
+	kubeCfg, err := clientCfg.ClientConfig()
 	if err != nil {
 		return errors.Wrap(err, "failed to read config while starting custom informers")
+	}
+
+	crdList, err := getCrdList(kubeCfg)
+	if err != nil {
+		return err
 	}
 
 	dynamicClient, err := dynamic.NewForConfig(kubeCfg)
@@ -119,20 +109,46 @@ func (i *kubeWatcherImpl) startCustomInformers(requested []CrdWatch) error {
 		return errors.Wrap(err, "failed to instantiate client for custom informers")
 	}
 
-	for _, watch := range requested {
-		if watch.ResourceArg == "" {
-			continue
-		}
-		f := dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynamicClient, i.resync, watch.Namespace, nil)
-		resource, _ := schema.ParseResourceArg(watch.ResourceArg)
+	f := dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynamicClient, i.resync, "", nil)
+	for _, crd := range crdList {
+		resource, _ := schema.ParseResourceArg(crd)
 		informer := f.ForResource(*resource)
-		informer.Informer().AddEventHandler(i.getEventHandlerForResource(resource.Resource))
 
-		glog.Infof("Starting customer informer for: %s  [namespace: %s]", watch.ResourceArg, watch.Namespace)
-		go informer.Informer().Run(i.stopChan)
+		resourceKind := fmt.Sprintf("%s.%s", resource.Resource, resource.Group)
+		if resource.Group == "" {
+			resourceKind = resource.Resource
+		}
+		informer.Informer().AddEventHandler(i.getEventHandlerForResource(resourceKind))
+
+		go func() {
+			glog.V(2).Infof("Starting CRD informer for: %s (%v)", resourceKind, resource)
+			informer.Informer().Run(i.stopChan)
+			glog.V(2).Infof("Exited CRD informer for: %s", resourceKind)
+		}()
 	}
 
 	return nil
+}
+
+func getCrdList(kubeCfg *rest.Config) ([]string, error) {
+	crdClient, err := clientset.NewForConfig(kubeCfg)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to instantiate client for querying CRDs")
+	}
+
+	crdList, err := crdClient.ApiextensionsV1beta1().CustomResourceDefinitions().List(metav1.ListOptions{})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to query CRDs")
+	}
+
+	glog.Infof("Found %d CRD definitions", len(crdList.Items))
+	var resources []string
+	for _, crd := range crdList.Items {
+		resourceName := fmt.Sprintf("%s.%s.%s", crd.Spec.Names.Plural, crd.Spec.Version, crd.Spec.Group)
+		glog.V(5).Infof("CRD: %s, kind: %s, plural:%s, singular:%s, short names:%v", resourceName, crd.Spec.Names.Kind, crd.Spec.Names.Plural, crd.Spec.Names.Singular, crd.Spec.Names.ShortNames)
+		resources = append(resources, resourceName)
+	}
+	return resources, nil
 }
 
 func (i *kubeWatcherImpl) getEventHandlerForResource(resourceKind string) cache.ResourceEventHandler {
@@ -194,7 +210,7 @@ func (i *kubeWatcherImpl) processUpdate(kind string, obj interface{}, watchResul
 	metricIngressKubewatchcount.WithLabelValues(kind, watchResult.WatchType.String(), kubeMetadata.Namespace).Inc()
 	metricIngressKubewatchbytes.WithLabelValues(kind, watchResult.WatchType.String(), kubeMetadata.Namespace).Add(float64(len(resourceJson)))
 
-	glog.V(2).Infof("Informer update - Name: %s, Namespace: %s, ResourceVersion: %s", kubeMetadata.Name, kubeMetadata.Namespace, kubeMetadata.ResourceVersion)
+	glog.V(5).Infof("Informer update - Name: %s, Namespace: %s, ResourceVersion: %s", kubeMetadata.Name, kubeMetadata.Namespace, kubeMetadata.ResourceVersion)
 	watchResult.Payload = resourceJson
 	i.writeToOutChan(watchResult)
 }

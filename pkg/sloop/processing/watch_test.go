@@ -8,7 +8,7 @@
 package processing
 
 import (
-	"github.com/dgraph-io/badger"
+	"github.com/dgraph-io/badger/v2"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/salesforce/sloop/pkg/sloop/kubeextractor"
 	"github.com/salesforce/sloop/pkg/sloop/store/typed"
@@ -217,6 +217,7 @@ func Test_getLastKubeWatchResult(t *testing.T) {
 	err = tables.Db().Update(func(txn badgerwrap.Txn) error {
 		return updateKubeWatchTable(tables, txn, &watchRec, metadata, true)
 	})
+	assert.Nil(t, err)
 
 	err = tables.Db().View(func(txn badgerwrap.Txn) error {
 		prevWatch, err := getLastKubeWatchResult(tables, txn, ts, kubeextractor.NodeKind, metadata.Namespace, "differentName")

@@ -8,7 +8,9 @@
 package badgerwrap
 
 import (
-	"github.com/dgraph-io/badger"
+	"io"
+
+	"github.com/dgraph-io/badger/v2"
 	"github.com/pkg/errors"
 )
 
@@ -74,6 +76,18 @@ func (b *BadgerDb) Tables(withKeysCount bool) []badger.TableInfo {
 	return b.db.Tables(withKeysCount)
 }
 
+func (b *BadgerDb) Backup(w io.Writer, since uint64) (uint64, error) {
+	return b.db.Backup(w, since)
+}
+
+func (b *BadgerDb) Load(r io.Reader, maxPendingWrites int) error {
+	return b.db.Load(r, maxPendingWrites)
+}
+
+func (b *BadgerDb) RunValueLogGC(discardRatio float64) error {
+	return b.db.RunValueLogGC(discardRatio)
+}
+
 // Transaction
 
 func (t *BadgerTxn) Get(key []byte) (Item, error) {
@@ -108,6 +122,18 @@ func (i *BadgerItem) Value(fn func(val []byte) error) error {
 
 func (i *BadgerItem) ValueCopy(dst []byte) ([]byte, error) {
 	return i.item.ValueCopy(dst)
+}
+
+func (i *BadgerItem) KeyCopy(dst []byte) []byte {
+	return i.item.KeyCopy(dst)
+}
+
+func (i *BadgerItem) EstimatedSize() int64 {
+	return i.item.EstimatedSize()
+}
+
+func (i *BadgerItem) IsDeletedOrExpired() bool {
+	return i.item.IsDeletedOrExpired()
 }
 
 // Iterator

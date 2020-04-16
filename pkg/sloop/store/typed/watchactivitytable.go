@@ -9,9 +9,9 @@ package typed
 
 import (
 	"fmt"
-	"github.com/dgraph-io/badger"
+	"github.com/dgraph-io/badger/v2"
+	"github.com/salesforce/sloop/pkg/sloop/common"
 	"github.com/salesforce/sloop/pkg/sloop/store/untyped/badgerwrap"
-	"strings"
 )
 
 // Key is /<partition>/<kind>/<namespace>/<name>
@@ -33,18 +33,20 @@ func NewWatchActivityKey(partitionId string, kind string, namespace string, name
 	return &WatchActivityKey{PartitionId: partitionId, Kind: kind, Namespace: namespace, Name: name, Uid: uid}
 }
 
-func (_ *WatchActivityKey) TableName() string {
+func NewWatchActivityKeyComparator(kind string, namespace string, name string, uid string) *WatchActivityKey {
+	return &WatchActivityKey{Kind: kind, Namespace: namespace, Name: name, Uid: uid}
+}
+
+func (*WatchActivityKey) TableName() string {
 	return "watchactivity"
 }
 
 func (k *WatchActivityKey) Parse(key string) error {
-	parts := strings.Split(key, "/")
-	if len(parts) != 7 {
-		return fmt.Errorf("Key should have 6 parts: %v", key)
+	err, parts := common.ParseKey(key)
+	if err != nil {
+		return err
 	}
-	if parts[0] != "" {
-		return fmt.Errorf("Key should start with /: %v", key)
-	}
+
 	if parts[1] != k.TableName() {
 		return fmt.Errorf("Second part of key (%v) should be %v", key, k.TableName())
 	}
@@ -56,11 +58,12 @@ func (k *WatchActivityKey) Parse(key string) error {
 	return nil
 }
 
+//todo: need to make sure it can work as keyPrefix when some fields are empty
 func (k *WatchActivityKey) String() string {
 	return fmt.Sprintf("/%v/%v/%v/%v/%v/%v", k.TableName(), k.PartitionId, k.Kind, k.Namespace, k.Name, k.Uid)
 }
 
-func (_ *WatchActivityKey) ValidateKey(key string) error {
+func (*WatchActivityKey) ValidateKey(key string) error {
 	newKey := WatchActivityKey{}
 	return newKey.Parse(key)
 }
